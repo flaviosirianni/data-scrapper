@@ -23,7 +23,7 @@ from .models import FightRecord
 logger = logging.getLogger(__name__)
 
 BASE_URL = "http://www.ufcstats.com"
-EVENTS_URL = f"{BASE_URL}/statistics/events/completed"
+EVENTS_URL = f"{BASE_URL}/statistics/events/completed?page=all"
 DATA_DIR = Path(__file__).parent.parent.parent / "data" / "ufc"
 STATE_FILE = DATA_DIR / "state.json"
 FIGHTS_FILE = DATA_DIR / "fights.json"
