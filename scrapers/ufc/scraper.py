@@ -33,6 +33,13 @@ DELAY_MIN = 1.5
 DELAY_MAX = 3.0
 
 
+def _event_year(event: dict) -> int:
+    """Extract year from event_date string (e.g. 'March 28, 2026' → 2026)."""
+    import re as _re
+    m = _re.search(r"\b(19|20)\d{2}\b", event.get("event_date", ""))
+    return int(m.group()) if m else 0
+
+
 def _polite_delay():
     time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
@@ -108,6 +115,7 @@ class UfcScraper:
         self,
         event_ids: Optional[list[str]] = None,
         scrape_all: bool = False,
+        min_year: Optional[int] = None,
     ) -> int:
         """
         Main entry point.
@@ -115,6 +123,7 @@ class UfcScraper:
         Args:
             event_ids: If provided, scrape only these specific event IDs.
             scrape_all: If True, ignore state and re-scrape everything.
+            min_year: If provided, skip events before this year.
 
         Returns:
             Number of new fights scraped.
@@ -139,7 +148,7 @@ class UfcScraper:
                     # Scrape specific events — fetch their metadata from the events page
                     events_to_scrape = self._resolve_event_ids(page, event_ids)
                 else:
-                    events_to_scrape = self._fetch_all_events(page, scrape_all)
+                    events_to_scrape = self._fetch_all_events(page, scrape_all, min_year=min_year)
 
                 logger.info("%d event(s) to scrape", len(events_to_scrape))
 
@@ -165,12 +174,20 @@ class UfcScraper:
         logger.info("Total new fights scraped: %d", new_fight_count)
         return new_fight_count
 
-    def _fetch_all_events(self, page: Page, scrape_all: bool) -> list[dict]:
+    def _fetch_all_events(
+        self, page: Page, scrape_all: bool, min_year: Optional[int] = None
+    ) -> list[dict]:
         """Fetch events listing and return events not yet scraped."""
         logger.info("Fetching events list from %s", EVENTS_URL)
         html = _get_html(page, EVENTS_URL)
         all_events = parse_events_page(html)
         logger.info("Found %d total events", len(all_events))
+
+        if min_year:
+            before = len(all_events)
+            all_events = [e for e in all_events if _event_year(e) >= min_year]
+            logger.info("Filtered to %d events from %d+ (dropped %d older events)",
+                        len(all_events), min_year, before - len(all_events))
 
         if scrape_all:
             return all_events
