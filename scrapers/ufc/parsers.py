@@ -3,11 +3,15 @@ HTML parsers for ufcstats.com pages.
 
 Three parsers:
   - parse_events_page: /statistics/events/completed  →  list of event dicts
-  - parse_event_page:  /event-details/{id}           →  list of fight link dicts
-  - parse_fight_page:  /fight-details/{id}           →  FightRecord (partial — no event context)
+  - parse_event_page:  /event-details/{id}           →  list of fight stub dicts
+  - parse_fight_page:  /fight-details/{id}           →  FightRecord
 
-ufcstats.com uses server-rendered HTML with class names following the
-`b-<section>__<element>` BEM convention.
+HTML conventions observed on ufcstats.com:
+  - BEM class names: b-<section>__<element>
+  - Stats cells hold TWO <p class="b-fight-details__table-text"> tags per fighter
+  - Summary tables: plain <table> (no class), one <tbody> with one <tr>
+  - Per-round tables: class="b-fight-details__table js-fight-table",
+    with <thead>Round N</thead><tbody>...</tbody> pairs for each round
 """
 import re
 import logging
@@ -22,14 +26,17 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _text(tag) -> str:
-    if tag is None:
-        return ""
-    return tag.get_text(separator=" ", strip=True)
+_BONUS_MAP = {"perf": "PERF", "fight": "FIGHT", "sub": "SUB", "ko": "KO"}
+
+def _bonus_from_img(img_tag: Tag) -> str | None:
+    """Extract bonus type from image src filename (alt text is always empty)."""
+    src = img_tag.get("src", "").lower()
+    fname = src.rstrip("/").split("/")[-1].replace(".png", "")
+    return _BONUS_MAP.get(fname)
 
 
 def _parse_of(text: str) -> StrikeStat:
-    """Parse 'X of Y' into StrikeStat. Also handles plain integers."""
+    """Parse 'X of Y' format into StrikeStat. Also handles plain integers."""
     text = text.strip()
     m = re.match(r"(\d+)\s+of\s+(\d+)", text, re.IGNORECASE)
     if m:
@@ -41,7 +48,9 @@ def _parse_of(text: str) -> StrikeStat:
 
 
 def _parse_pct(text: str) -> float | None:
-    text = text.strip().rstrip("%")
+    text = text.strip().rstrip("%").strip()
+    if text in ("---", "", "—"):
+        return None
     try:
         return float(text)
     except ValueError:
@@ -56,31 +65,33 @@ def _parse_int(text: str) -> int | None:
         return None
 
 
-def _cells_text(row: Tag) -> list[str]:
-    """Return stripped text of all <td> or <th> cells in a row."""
-    return [c.get_text(separator=" ", strip=True) for c in row.find_all(["td", "th"])]
+def _cell_values(cell: Tag) -> tuple[str, str]:
+    """
+    Extract the two per-fighter values from a stats <td>.
+    Each cell holds two <p class="b-fight-details__table-text"> elements,
+    one per fighter.
+    """
+    ps = cell.find_all("p", class_="b-fight-details__table-text")
+    v1 = ps[0].get_text(strip=True) if len(ps) > 0 else ""
+    v2 = ps[1].get_text(strip=True) if len(ps) > 1 else ""
+    return v1, v2
 
 
-def _two_line_cell(cell: Tag) -> tuple[str, str]:
+def _parse_row_into_stats(row: Tag) -> tuple[FighterStats, FighterStats]:
     """
-    Many ufcstats cells contain two values (one per fighter) separated by <br>
-    or wrapped in <p> tags. Returns (line1, line2).
+    Parse one <tr> from a stats table into (fighter_1_stats, fighter_2_stats).
+    Column layout for totals rows:
+      0: Fighter name  1: KD  2: Sig.str  3: Sig.str%  4: Total str
+      5: TD            6: TD%  7: Sub.att  8: Rev.      9: Ctrl
+    Column layout for sig strikes rows:
+      0: Fighter name  1: Sig.str  2: Sig.str%  3: Head  4: Body
+      5: Leg           6: Distance  7: Clinch    8: Ground
+    This function returns stats with only the fields that map to known positions.
+    The caller (parse_fight_page) decides which layout applies.
     """
-    # Try <p> tags first
-    ps = cell.find_all("p")
-    if len(ps) >= 2:
-        return ps[0].get_text(strip=True), ps[1].get_text(strip=True)
-    # Fall back to <br> split
-    raw = cell.decode_contents()
-    parts = re.split(r"<br\s*/?>", raw, flags=re.IGNORECASE)
-    if len(parts) >= 2:
-        return (
-            BeautifulSoup(parts[0], "lxml").get_text(strip=True),
-            BeautifulSoup(parts[1], "lxml").get_text(strip=True),
-        )
-    # Single value — return same for both
-    t = cell.get_text(strip=True)
-    return t, t
+    cells = row.find_all("td")
+    vals: list[tuple[str, str]] = [_cell_values(c) for c in cells]
+    return vals
 
 
 # ---------------------------------------------------------------------------
@@ -111,12 +122,11 @@ def parse_events_page(html: str) -> list[dict]:
         if row:
             cells = row.find_all("td")
             if cells:
-                # Date is typically in a <span> inside the first cell
-                date_span = cells[0].find("span")
-                if date_span:
-                    event_date = date_span.get_text(strip=True)
+                # Date is in a <span> inside the first cell, after the link
+                spans = cells[0].find_all("span")
+                if spans:
+                    event_date = spans[0].get_text(strip=True)
                 else:
-                    # Try second non-link text node
                     raw = cells[0].get_text(separator="\n", strip=True)
                     lines = [l for l in raw.split("\n") if l and l != event_name]
                     if lines:
@@ -130,7 +140,6 @@ def parse_events_page(html: str) -> list[dict]:
             "event_date": event_date,
             "event_location": event_location,
         })
-        logger.debug("Found event: %s (%s)", event_name, event_id)
 
     logger.info("Parsed %d events from events page", len(events))
     return events
@@ -143,98 +152,85 @@ def parse_events_page(html: str) -> list[dict]:
 def parse_event_page(html: str) -> list[dict]:
     """
     Parse /event-details/{id}.
-    Returns list of: {fight_id, fighter_1_name, fighter_1_result,
-                       fighter_2_name, fighter_2_result,
-                       weight_class, method, round, time, bonuses}
+    Returns list of fight stubs: {fight_id, fighter_1_name, fighter_1_result,
+    fighter_2_name, fighter_2_result, weight_class, method, method_detail,
+    round, time, bonuses}
     """
     soup = BeautifulSoup(html, "lxml")
     fights = []
     seen = set()
 
-    # ufcstats event pages: table rows have data-link="/fight-details/ID"
-    # OR the first fighter name is wrapped in <a href="/fight-details/ID">
     tbody = soup.find("tbody")
     if not tbody:
         logger.warning("No <tbody> found in event page")
         return fights
 
-    rows = tbody.find_all("tr", recursive=False)
-
-    for row in rows:
-        fight_id = None
-
-        # Strategy 1: data-link attribute on <tr>
+    for row in tbody.find_all("tr", recursive=False):
+        # Fight ID from data-link attribute
         data_link = row.get("data-link", "")
-        if data_link and "/fight-details/" in data_link:
-            fight_id = data_link.rstrip("/").split("/")[-1]
-
-        # Strategy 2: <a> tag inside row pointing to fight details
-        if not fight_id:
-            for a in row.find_all("a", href=re.compile(r"/fight-details/", re.I)):
-                fight_id = a.get("href", "").rstrip("/").split("/")[-1]
-                break
-
+        fight_id = data_link.rstrip("/").split("/")[-1] if "/fight-details/" in data_link else None
         if not fight_id or fight_id in seen:
             continue
         seen.add(fight_id)
 
         cells = row.find_all("td")
         if len(cells) < 8:
-            logger.debug("Skipping row with only %d cells", len(cells))
             continue
 
-        # Cell layout (typical ufcstats event table):
-        # 0: W/L badges  1: Fighter names  2: KD  3: STR  4: TD  5: SUB
-        # 6: Weight Class  7: Method  8: Round  9: Time
-        wl_cell = cells[0]
-        fighter_cell = cells[1]
+        # Cell 0: result badge (b-flag_style_green = win)
+        flag = cells[0].find("a", class_=re.compile(r"b-flag"))
+        flag_classes = " ".join(flag.get("class", [])) if flag else ""
+        flag_text = flag.get_text(strip=True).lower() if flag else ""
+        if "green" in flag_classes or flag_text == "win":
+            f1_result, f2_result = "W", "L"
+        elif "gray" in flag_classes or flag_text == "loss":
+            f1_result, f2_result = "L", "W"
+        elif "draw" in flag_classes or flag_text == "draw":
+            f1_result, f2_result = "D", "D"
+        else:
+            f1_result, f2_result = flag_text.upper(), ""
 
-        # W/L: two lines
-        wl_1, wl_2 = _two_line_cell(wl_cell)
-        fighter_1, fighter_2 = _two_line_cell(fighter_cell)
+        # Cell 1: fighter names (two <p> tags)
+        name_ps = cells[1].find_all("p", class_="b-fight-details__table-text")
+        fighter_1 = name_ps[0].get_text(strip=True) if len(name_ps) > 0 else ""
+        fighter_2 = name_ps[1].get_text(strip=True) if len(name_ps) > 1 else ""
 
-        # Normalize result text (e.g. "win" → "W")
-        def norm_result(t: str) -> str:
-            t = t.upper().strip()
-            if t in ("WIN", "W"):
-                return "W"
-            if t in ("LOSS", "L"):
-                return "L"
-            if t in ("DRAW", "D"):
-                return "D"
-            if t in ("NC", "NO CONTEST"):
-                return "NC"
-            return t
-
-        # Bonuses: look for <img> alt attributes or spans with bonus class
+        # Cell 6: weight class + bonus imgs
+        weight_class = ""
         bonuses = []
-        for img in row.find_all("img"):
-            alt = img.get("alt", "").strip()
-            if alt:
-                bonuses.append(alt)
-        for span in row.find_all("span", class_=re.compile(r"bonus|perf|fight|sub|ko", re.I)):
-            txt = span.get_text(strip=True)
-            if txt:
-                bonuses.append(txt)
+        if len(cells) > 6:
+            wc_cell = cells[6]
+            for img in wc_cell.find_all("img"):
+                bonus = _bonus_from_img(img)
+                if bonus:
+                    bonuses.append(bonus)
+                img.decompose()
+            weight_class = wc_cell.get_text(separator=" ", strip=True)
 
-        weight_class = cells[6].get_text(strip=True) if len(cells) > 6 else ""
-        method_raw = cells[7].get_text(separator=" ", strip=True) if len(cells) > 7 else ""
-        round_raw = cells[8].get_text(strip=True) if len(cells) > 8 else ""
-        time_raw = cells[9].get_text(strip=True) if len(cells) > 9 else ""
+        # Cell 7: method (two <p> tags: method + detail)
+        method, method_detail = "", ""
+        if len(cells) > 7:
+            method_ps = cells[7].find_all("p", class_="b-fight-details__table-text")
+            method = method_ps[0].get_text(strip=True) if len(method_ps) > 0 else ""
+            method_detail = method_ps[1].get_text(strip=True) if len(method_ps) > 1 else ""
+
+        # Cell 8: round, Cell 9: time
+        round_val = _parse_int(cells[8].get_text(strip=True)) if len(cells) > 8 else None
+        time_val = cells[9].get_text(strip=True) if len(cells) > 9 else ""
 
         fights.append({
             "fight_id": fight_id,
             "fighter_1_name": fighter_1,
-            "fighter_1_result": norm_result(wl_1),
+            "fighter_1_result": f1_result,
             "fighter_2_name": fighter_2,
-            "fighter_2_result": norm_result(wl_2),
+            "fighter_2_result": f2_result,
             "weight_class": weight_class,
-            "method": method_raw,
-            "round": _parse_int(round_raw),
-            "time": time_raw,
-            "bonuses": list(set(bonuses)),
+            "method": method,
+            "method_detail": method_detail,
+            "round": round_val,
+            "time": time_val,
+            "bonuses": bonuses,
         })
-        logger.debug("Found fight: %s vs %s (%s)", fighter_1, fighter_2, fight_id)
 
     logger.info("Parsed %d fights from event page", len(fights))
     return fights
@@ -244,154 +240,119 @@ def parse_event_page(html: str) -> list[dict]:
 # Fight detail page parser
 # ---------------------------------------------------------------------------
 
-def _parse_fighter_stats_from_rows(
-    totals_rows: list[list[str]],
-    sig_rows: list[list[str]],
-) -> tuple[FighterStats, FighterStats]:
+def _extract_summary_stats(table: Tag) -> list[tuple[str, str]]:
     """
-    Build FighterStats for both fighters from the totals and sig strike row data.
-
-    totals_rows: [[f1_val, f2_val], ...] for each column
-    sig_rows:    [[f1_val, f2_val], ...] for each column
-
-    Expected totals columns (after fighter name):
-      KD | SIG.STR | SIG.STR% | TOTAL STR | TD | TD% | SUB ATT | REV | CTRL
-
-    Expected sig columns (after fighter name):
-      SIG STR | SIG STR% | HEAD | BODY | LEG | DISTANCE | CLINCH | GROUND
+    Extract per-column (f1_val, f2_val) pairs from a summary table.
+    Summary tables have one <tbody> with one <tr>; each <td> contains
+    two <p class="b-fight-details__table-text"> elements.
     """
-    f1 = FighterStats()
-    f2 = FighterStats()
+    tbody = table.find("tbody")
+    if not tbody:
+        return []
+    row = tbody.find("tr")
+    if not row:
+        return []
+    return [_cell_values(td) for td in row.find_all("td")]
 
-    # --- Totals ---
-    # totals_rows is indexed by column position
-    # Column 0 = fighter name (skip), then per column above
-    col = totals_rows  # list of [f1_text, f2_text]
-    if len(col) > 1:
-        f1.kd = _parse_int(col[1][0]); f2.kd = _parse_int(col[1][1])
-    if len(col) > 2:
-        f1.sig_str = _parse_of(col[2][0]); f2.sig_str = _parse_of(col[2][1])
-    if len(col) > 3:
-        f1.sig_str_pct = _parse_pct(col[3][0]); f2.sig_str_pct = _parse_pct(col[3][1])
-    if len(col) > 4:
-        f1.total_str = _parse_of(col[4][0]); f2.total_str = _parse_of(col[4][1])
-    if len(col) > 5:
-        f1.td = _parse_of(col[5][0]); f2.td = _parse_of(col[5][1])
-    if len(col) > 6:
-        f1.td_pct = _parse_pct(col[6][0]); f2.td_pct = _parse_pct(col[6][1])
-    if len(col) > 7:
-        f1.sub_att = _parse_int(col[7][0]); f2.sub_att = _parse_int(col[7][1])
-    if len(col) > 8:
-        f1.rev = _parse_int(col[8][0]); f2.rev = _parse_int(col[8][1])
-    if len(col) > 9:
-        f1.ctrl = col[9][0]; f2.ctrl = col[9][1]
 
-    # --- Significant strikes ---
-    scol = sig_rows
-    if len(scol) > 1:
-        f1.sig_str = _parse_of(scol[1][0]); f2.sig_str = _parse_of(scol[1][1])
-    if len(scol) > 2:
-        f1.sig_str_pct = _parse_pct(scol[2][0]); f2.sig_str_pct = _parse_pct(scol[2][1])
-    if len(scol) > 3:
-        f1.head = _parse_of(scol[3][0]); f2.head = _parse_of(scol[3][1])
-    if len(scol) > 4:
-        f1.body = _parse_of(scol[4][0]); f2.body = _parse_of(scol[4][1])
-    if len(scol) > 5:
-        f1.leg = _parse_of(scol[5][0]); f2.leg = _parse_of(scol[5][1])
-    if len(scol) > 6:
-        f1.distance = _parse_of(scol[6][0]); f2.distance = _parse_of(scol[6][1])
-    if len(scol) > 7:
-        f1.clinch = _parse_of(scol[7][0]); f2.clinch = _parse_of(scol[7][1])
-    if len(scol) > 8:
-        f1.ground = _parse_of(scol[8][0]); f2.ground = _parse_of(scol[8][1])
+def _extract_round_stats(table: Tag) -> dict[int, list[tuple[str, str]]]:
+    """
+    Extract per-round stats from a per-round table (class js-fight-table).
+    Returns {round_number: [(f1_val, f2_val), ...per column...]}
+    """
+    result: dict[int, list[tuple[str, str]]] = {}
+    # The table alternates: <thead>Round N</thead> <tbody><tr>data</tr></tbody>
+    # We scan direct children of the table in order
+    current_round = None
+    for child in table.children:
+        if not isinstance(child, Tag):
+            continue
+        if child.name == "thead":
+            text = child.get_text(strip=True)
+            m = re.search(r"Round\s+(\d+)", text, re.IGNORECASE)
+            if m:
+                current_round = int(m.group(1))
+        elif child.name == "tbody" and current_round is not None:
+            row = child.find("tr")
+            if row:
+                result[current_round] = [_cell_values(td) for td in row.find_all("td")]
+            current_round = None  # reset after consuming
+    return result
 
+
+def _build_fighter_stats_totals(cols: list[tuple[str, str]]) -> tuple[FighterStats, FighterStats]:
+    """
+    Build FighterStats from totals column values.
+    Col layout: 0=name, 1=KD, 2=Sig.str, 3=Sig.str%, 4=Total str,
+                5=TD, 6=TD%, 7=Sub.att, 8=Rev, 9=Ctrl
+    """
+    f1, f2 = FighterStats(), FighterStats()
+    if len(cols) > 1:
+        f1.kd = _parse_int(cols[1][0]);      f2.kd = _parse_int(cols[1][1])
+    if len(cols) > 2:
+        f1.sig_str = _parse_of(cols[2][0]);  f2.sig_str = _parse_of(cols[2][1])
+    if len(cols) > 3:
+        f1.sig_str_pct = _parse_pct(cols[3][0]); f2.sig_str_pct = _parse_pct(cols[3][1])
+    if len(cols) > 4:
+        f1.total_str = _parse_of(cols[4][0]); f2.total_str = _parse_of(cols[4][1])
+    if len(cols) > 5:
+        f1.td = _parse_of(cols[5][0]);       f2.td = _parse_of(cols[5][1])
+    if len(cols) > 6:
+        f1.td_pct = _parse_pct(cols[6][0]);  f2.td_pct = _parse_pct(cols[6][1])
+    if len(cols) > 7:
+        f1.sub_att = _parse_int(cols[7][0]); f2.sub_att = _parse_int(cols[7][1])
+    if len(cols) > 8:
+        f1.rev = _parse_int(cols[8][0]);     f2.rev = _parse_int(cols[8][1])
+    if len(cols) > 9:
+        f1.ctrl = cols[9][0];                f2.ctrl = cols[9][1]
     return f1, f2
 
 
-def _extract_table_columns(table: Tag) -> list[list[str]]:
+def _apply_sig_strikes(f1: FighterStats, f2: FighterStats, cols: list[tuple[str, str]]):
     """
-    Given a two-row data table (one row per fighter), return a list of
-    [f1_text, f2_text] per column.
-
-    Handles the ufcstats pattern where each cell may contain two <p> tags
-    (one per fighter in a single row) OR there are two separate rows.
+    Overlay significant-strike breakdown onto existing FighterStats objects.
+    Col layout: 0=name, 1=Sig.str, 2=Sig.str%, 3=Head, 4=Body,
+                5=Leg, 6=Distance, 7=Clinch, 8=Ground
     """
-    tbody = table.find("tbody") or table
-    rows = tbody.find_all("tr", recursive=False)
-
-    # Filter out header rows
-    data_rows = [r for r in rows if r.find("td")]
-    if not data_rows:
-        return []
-
-    if len(data_rows) == 1:
-        # Single row with two-line cells (one value per fighter per cell)
-        cells = data_rows[0].find_all("td")
-        result = []
-        for cell in cells:
-            v1, v2 = _two_line_cell(cell)
-            result.append([v1, v2])
-        return result
-    else:
-        # Two rows: first row = fighter 1, second = fighter 2
-        cells_1 = data_rows[0].find_all("td")
-        cells_2 = data_rows[1].find_all("td")
-        result = []
-        max_cols = max(len(cells_1), len(cells_2))
-        for i in range(max_cols):
-            v1 = cells_1[i].get_text(strip=True) if i < len(cells_1) else ""
-            v2 = cells_2[i].get_text(strip=True) if i < len(cells_2) else ""
-            result.append([v1, v2])
-        return result
-
-
-def _extract_per_round_tables(section: Tag) -> list[tuple[int, list[list[str]]]]:
-    """
-    Find all per-round sub-tables within a section.
-    Returns list of (round_number, columns) tuples.
-    """
-    rounds = []
-    # Round labels are typically in <p> or heading elements saying "Round N"
-    # Tables for each round follow
-    round_tables = section.find_all("table")
-    # The first table is the totals table; subsequent tables are per-round
-    # OR they may be siblings outside the table
-
-    # Alternative: look for headings with "Round"
-    for heading in section.find_all(re.compile(r"^(p|h[2-6]|th)$"), string=re.compile(r"round\s+\d+", re.I)):
-        rnum_match = re.search(r"(\d+)", heading.get_text())
-        if not rnum_match:
-            continue
-        rnum = int(rnum_match.group(1))
-        # Find the next table sibling
-        nxt = heading.find_next_sibling("table") or heading.find_parent("tr")
-        if nxt and nxt.name == "table":
-            cols = _extract_table_columns(nxt)
-            rounds.append((rnum, cols))
-
-    return rounds
+    if len(cols) > 1:
+        f1.sig_str = _parse_of(cols[1][0]);       f2.sig_str = _parse_of(cols[1][1])
+    if len(cols) > 2:
+        f1.sig_str_pct = _parse_pct(cols[2][0]);  f2.sig_str_pct = _parse_pct(cols[2][1])
+    if len(cols) > 3:
+        f1.head = _parse_of(cols[3][0]);           f2.head = _parse_of(cols[3][1])
+    if len(cols) > 4:
+        f1.body = _parse_of(cols[4][0]);           f2.body = _parse_of(cols[4][1])
+    if len(cols) > 5:
+        f1.leg = _parse_of(cols[5][0]);            f2.leg = _parse_of(cols[5][1])
+    if len(cols) > 6:
+        f1.distance = _parse_of(cols[6][0]);       f2.distance = _parse_of(cols[6][1])
+    if len(cols) > 7:
+        f1.clinch = _parse_of(cols[7][0]);         f2.clinch = _parse_of(cols[7][1])
+    if len(cols) > 8:
+        f1.ground = _parse_of(cols[8][0]);         f2.ground = _parse_of(cols[8][1])
 
 
 def parse_fight_page(html: str) -> FightRecord:
     """
     Parse /fight-details/{id}.
-    Returns a FightRecord with all stats populated (no event context).
+    Returns a FightRecord with all stats populated (event context added by scraper).
     """
     soup = BeautifulSoup(html, "lxml")
     record = FightRecord()
 
-    # --- Fight header ---
-    # Fighter names and results
-    fighter_sections = soup.find_all(class_=re.compile(r"b-fight-details__person", re.I))
-    fighters_parsed = []
-    for fs in fighter_sections:
-        name_tag = fs.find(class_=re.compile(r"b-fight-details__person-name|b-link", re.I))
-        result_tag = fs.find(class_=re.compile(r"b-fight-details__person-status", re.I))
+    # --- Fighter names and results ---
+    # <div class="b-fight-details__person"> appears exactly twice, one per fighter
+    person_divs = [
+        t for t in soup.find_all("div")
+        if t.get("class") and "b-fight-details__person" in t.get("class", [])
+    ]
+    for div in person_divs[:2]:
+        status_tag = div.find("i", class_=re.compile(r"b-fight-details__person-status"))
+        name_tag = div.find("h3", class_="b-fight-details__person-name")
         if not name_tag:
-            name_tag = fs.find("a") or fs.find("h3") or fs.find("span")
-        name = name_tag.get_text(strip=True) if name_tag else ""
-        result_raw = result_tag.get_text(strip=True).upper() if result_tag else ""
-        # Normalize
+            name_tag = div.find(class_="b-fight-details__person-name")
+
+        result_raw = status_tag.get_text(strip=True).upper() if status_tag else ""
         if result_raw in ("W", "WIN"):
             result = "W"
         elif result_raw in ("L", "LOSS"):
@@ -402,163 +363,103 @@ def parse_fight_page(html: str) -> FightRecord:
             result = "NC"
         else:
             result = result_raw
-        fighters_parsed.append((name, result))
 
-    if len(fighters_parsed) >= 2:
-        record.fighter_1_name, record.fighter_1_result = fighters_parsed[0]
-        record.fighter_2_name, record.fighter_2_result = fighters_parsed[1]
-    elif len(fighters_parsed) == 1:
-        record.fighter_1_name, record.fighter_1_result = fighters_parsed[0]
+        name = ""
+        if name_tag:
+            a = name_tag.find("a")
+            name = (a or name_tag).get_text(strip=True)
 
-    # --- Fight metadata box ---
-    # ufcstats: dl/dt/dd pairs or a table with method, round, time, etc.
-    meta_section = (
-        soup.find(class_=re.compile(r"b-fight-details__fight", re.I))
-        or soup.find(class_=re.compile(r"b-fight-details__content", re.I))
-    )
-    if meta_section:
-        # Try <i> or <span> pairs for label:value
-        text_block = meta_section.get_text(separator="\n")
-        for line in text_block.split("\n"):
-            line = line.strip()
-            if line.upper().startswith("METHOD:"):
-                record.method = line.split(":", 1)[1].strip()
-            elif line.upper().startswith("ROUND:"):
-                record.round = _parse_int(line.split(":", 1)[1].strip())
-            elif line.upper().startswith("TIME:"):
-                record.time = line.split(":", 1)[1].strip()
-            elif line.upper().startswith("TIME FORMAT:"):
-                record.time_format = line.split(":", 1)[1].strip()
-            elif line.upper().startswith("REFEREE:"):
-                record.referee = line.split(":", 1)[1].strip()
-            elif line.upper().startswith("DETAILS:"):
-                record.details = line.split(":", 1)[1].strip()
+        if not record.fighter_1_name:
+            record.fighter_1_name = name
+            record.fighter_1_result = result
+        else:
+            record.fighter_2_name = name
+            record.fighter_2_result = result
 
-        # Weight class & bonuses
-        wc_tag = meta_section.find(class_=re.compile(r"weight|class|division", re.I))
-        if wc_tag:
-            record.weight_class = wc_tag.get_text(strip=True)
+    # --- Weight class and bonuses ---
+    fight_title = soup.find("i", class_="b-fight-details__fight-title")
+    if fight_title:
+        for img in fight_title.find_all("img"):
+            bonus = _bonus_from_img(img)
+            if bonus and bonus not in record.bonuses:
+                record.bonuses.append(bonus)
+            img.decompose()
+        title_text = fight_title.get_text(strip=True)
+        # "Middleweight Bout" → weight class = "Middleweight"
+        record.weight_class = re.sub(r"\s+bout\s*$", "", title_text, flags=re.IGNORECASE).strip()
 
-    # Method detail (e.g. "Punches to Head From Mount")
-    detail_tag = soup.find(class_=re.compile(r"b-fight-details__text-item_type_", re.I))
-    if not detail_tag:
-        # Try to find DETAILS: label
-        for i_tag in soup.find_all("i", class_=re.compile(r"b-fight-details", re.I)):
-            if "details" in i_tag.get_text(separator=" ", strip=True).lower():
-                sibling = i_tag.find_next_sibling() or i_tag.parent
-                record.details = (sibling or i_tag).get_text(strip=True)
-                break
+    # --- Fight metadata (Method, Round, Time, Referee, Details) ---
+    content = soup.find(class_="b-fight-details__content")
+    if content:
+        # First <p>: method, round, time, time format, referee
+        for item in content.find_all("i", class_=re.compile(r"b-fight-details__text-item")):
+            label_tag = item.find("i", class_="b-fight-details__label")
+            label = label_tag.get_text(strip=True).rstrip(":").upper() if label_tag else ""
+            # Value: remove the label <i> then get remaining text
+            if label_tag:
+                label_tag.decompose()
+            value = item.get_text(strip=True)
 
-    # Bonuses from img alt texts or colored labels in page header
-    for img in soup.find_all("img"):
-        alt = img.get("alt", "").strip()
-        if alt and alt not in record.bonuses:
-            record.bonuses.append(alt)
+            if label == "METHOD":
+                record.method = value
+            elif label == "ROUND":
+                record.round = _parse_int(value)
+            elif label == "TIME":
+                record.time = value
+            elif label == "TIME FORMAT":
+                record.time_format = value
+            elif label == "REFEREE":
+                record.referee = value
+
+        # Second <p>: details — text after the label <i>
+        ps = content.find_all("p", class_="b-fight-details__text")
+        if len(ps) >= 2:
+            detail_p = ps[1]
+            # Remove any nested <i> labels
+            for i_tag in detail_p.find_all("i"):
+                i_tag.decompose()
+            record.details = detail_p.get_text(strip=True)
 
     # --- Stats tables ---
-    # ufcstats fight detail page has two main sections:
-    #   1. TOTALS
-    #   2. SIGNIFICANT STRIKES
-    # Each has a summary table + per-round tables (expanded in Playwright before fetching HTML)
-
-    sections = soup.find_all("section", class_=re.compile(r"b-fight-details__section", re.I))
-    if not sections:
-        # Fallback: find all tables
-        sections = soup.find_all("table")
-
-    totals_section = None
-    sig_section = None
-
-    for sec in sections:
-        heading_text = ""
-        for hdr in sec.find_all(["h2", "h3", "p", "span"]):
-            t = hdr.get_text(strip=True).upper()
-            if t:
-                heading_text = t
-                break
-        if "TOTAL" in heading_text:
-            totals_section = sec
-        elif "SIGNIFICANT" in heading_text or "SIG" in heading_text:
-            sig_section = sec
-
-    # If section detection failed, try by table order
+    # Page has exactly 4 tables:
+    #   [0] Summary totals (plain <table>, no class)
+    #   [1] Per-round totals (class js-fight-table)
+    #   [2] Summary sig strikes (plain <table>, no class)
+    #   [3] Per-round sig strikes (class js-fight-table)
     all_tables = soup.find_all("table")
-    if not totals_section and len(all_tables) >= 1:
-        totals_section = all_tables[0].find_parent("section") or all_tables[0]
-    if not sig_section and len(all_tables) >= 2:
-        sig_section = all_tables[1].find_parent("section") or all_tables[1]
+    summary_tables = [t for t in all_tables if "js-fight-table" not in " ".join(t.get("class", []))]
+    round_tables = [t for t in all_tables if "js-fight-table" in " ".join(t.get("class", []))]
 
-    # Extract totals
-    totals_cols: list[list[str]] = []
-    sig_cols: list[list[str]] = []
+    # Totals summary
+    if len(summary_tables) >= 1:
+        cols = _extract_summary_stats(summary_tables[0])
+        record.fighter_1_totals, record.fighter_2_totals = _build_fighter_stats_totals(cols)
 
-    if totals_section:
-        first_table = totals_section.find("table") if totals_section.name != "table" else totals_section
-        if first_table:
-            totals_cols = _extract_table_columns(first_table)
+    # Sig strikes summary (overlays onto totals)
+    if len(summary_tables) >= 2:
+        sig_cols = _extract_summary_stats(summary_tables[1])
+        _apply_sig_strikes(record.fighter_1_totals, record.fighter_2_totals, sig_cols)
 
-    if sig_section:
-        first_table = sig_section.find("table") if sig_section.name != "table" else sig_section
-        if first_table:
-            sig_cols = _extract_table_columns(first_table)
+    # Per-round data
+    totals_by_round: dict[int, list] = {}
+    sig_by_round: dict[int, list] = {}
 
-    if totals_cols or sig_cols:
-        record.fighter_1_totals, record.fighter_2_totals = _parse_fighter_stats_from_rows(
-            totals_cols, sig_cols
-        )
+    if len(round_tables) >= 1:
+        totals_by_round = _extract_round_stats(round_tables[0])
+    if len(round_tables) >= 2:
+        sig_by_round = _extract_round_stats(round_tables[1])
 
-    # --- Per-round breakdown ---
-    # After Playwright clicks "PER ROUND", the page adds round sub-tables.
-    # We find them by looking for round heading elements.
-    round_data: dict[int, dict] = {}
-
-    def _get_or_create_round(n: int) -> dict:
-        if n not in round_data:
-            round_data[n] = {"totals_cols": [], "sig_cols": []}
-        return round_data[n]
-
-    # Strategy: find all elements containing "Round N" text, then grab the next table
-    for elem in soup.find_all(string=re.compile(r"Round\s+\d+", re.I)):
-        parent = elem.find_parent(["p", "th", "h2", "h3", "h4", "span", "div"])
-        if not parent:
-            continue
-        m = re.search(r"Round\s+(\d+)", str(elem), re.I)
-        if not m:
-            continue
-        rnum = int(m.group(1))
-
-        # Find the next table relative to this heading
-        nxt_table = parent.find_next("table")
-        if not nxt_table:
-            continue
-
-        # Determine if this is a totals or sig-strikes round table based on its section
-        in_sig = False
-        anc = parent
-        while anc:
-            cls = " ".join(anc.get("class", []))
-            txt = anc.get_text(separator=" ", strip=True).upper()
-            if "SIGNIFICANT" in txt or "SIG" in cls:
-                in_sig = True
-                break
-            anc = anc.parent
-
-        cols = _extract_table_columns(nxt_table)
-        rd = _get_or_create_round(rnum)
-        if in_sig:
-            rd["sig_cols"] = cols
-        else:
-            rd["totals_cols"] = cols
-
-    for rnum in sorted(round_data.keys()):
-        rd = round_data[rnum]
-        f1, f2 = _parse_fighter_stats_from_rows(rd["totals_cols"], rd["sig_cols"])
+    all_rounds = sorted(set(totals_by_round) | set(sig_by_round))
+    for rnum in all_rounds:
+        f1, f2 = _build_fighter_stats_totals(totals_by_round.get(rnum, []))
+        if rnum in sig_by_round:
+            _apply_sig_strikes(f1, f2, sig_by_round[rnum])
         record.rounds.append(RoundStats(round_number=rnum, fighter_1=f1, fighter_2=f2))
 
     logger.info(
-        "Parsed fight: %s vs %s | %d rounds of detail",
-        record.fighter_1_name,
-        record.fighter_2_name,
+        "Parsed fight: %s (%s) vs %s (%s) | %d rounds",
+        record.fighter_1_name, record.fighter_1_result,
+        record.fighter_2_name, record.fighter_2_result,
         len(record.rounds),
     )
     return record
