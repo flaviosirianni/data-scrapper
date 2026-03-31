@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+data/ufc/fights.json
+data/ufc/state.json
+.DS_Store
