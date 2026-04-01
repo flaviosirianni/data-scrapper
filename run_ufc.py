@@ -6,6 +6,7 @@ Usage:
   python run_ufc.py scrape --all                        # Re-scrape everything from scratch
   python run_ufc.py scrape --event-id 5c38639f860a5542 # Single event
   python run_ufc.py scrape --event-id ID1 --event-id ID2  # Multiple specific events
+  python run_ufc.py scrape-upcoming                     # Scrape upcoming events fight cards
 """
 import argparse
 import logging
@@ -24,7 +25,10 @@ def main():
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    scrape_cmd = sub.add_parser("scrape", help="Run the scraper")
+    # -------------------------------------------------------------------------
+    # scrape — completed fights
+    # -------------------------------------------------------------------------
+    scrape_cmd = sub.add_parser("scrape", help="Scrape completed fight stats")
     scrape_cmd.add_argument(
         "--all",
         dest="scrape_all",
@@ -52,9 +56,21 @@ def main():
         help="Enable debug-level logging",
     )
 
+    # -------------------------------------------------------------------------
+    # scrape-upcoming — upcoming events fight cards (names only, no stats)
+    # -------------------------------------------------------------------------
+    upcoming_cmd = sub.add_parser(
+        "scrape-upcoming", help="Scrape upcoming events fight cards (names, dates)"
+    )
+    upcoming_cmd.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug-level logging",
+    )
+
     args = parser.parse_args()
 
-    if args.debug:
+    if getattr(args, "debug", False):
         logging.getLogger().setLevel(logging.DEBUG)
 
     if args.command == "scrape":
@@ -68,6 +84,14 @@ def main():
         )
         print(f"\nDone. {count} new fight(s) scraped.")
         print(f"Data saved to: data/ufc/fights.json")
+
+    elif args.command == "scrape-upcoming":
+        from scrapers.ufc.upcoming import UfcUpcomingScraper
+
+        scraper = UfcUpcomingScraper()
+        count = scraper.run()
+        print(f"\nDone. {count} upcoming fight(s) found.")
+        print(f"Data saved to: data/ufc/upcoming.json")
 
 
 if __name__ == "__main__":

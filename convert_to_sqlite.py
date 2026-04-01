@@ -1,9 +1,10 @@
 """
-Convert fights.json to a SQLite database.
+Convert fights.json (and optionally upcoming.json) to a SQLite database.
 
 Schema:
-  fights      — one row per fight, flat stats for totals
-  fight_rounds — one row per fighter per round
+  fights        — one row per fight, flat stats for totals
+  fight_rounds  — one row per fighter per round
+  upcoming_fights — upcoming fight cards (names/dates, no stats)
 
 Usage:
   python convert_to_sqlite.py
@@ -13,10 +14,12 @@ import json
 import sqlite3
 import argparse
 from pathlib import Path
+from typing import Optional
 
 
-FIGHTS_JSON = Path("data/ufc/fights.json")
-SQLITE_DB   = Path("data/ufc/ufc.db")
+FIGHTS_JSON   = Path("data/ufc/fights.json")
+UPCOMING_JSON = Path("data/ufc/upcoming.json")
+SQLITE_DB     = Path("data/ufc/ufc.db")
 
 
 CREATE_FIGHTS = """
@@ -126,6 +129,20 @@ CREATE TABLE IF NOT EXISTS fight_rounds (
 )
 """
 
+CREATE_UPCOMING = """
+CREATE TABLE IF NOT EXISTS upcoming_fights (
+    fight_id        TEXT PRIMARY KEY,
+    event_id        TEXT,
+    event_name      TEXT,
+    event_date      TEXT,
+    event_location  TEXT,
+    card_order      INTEGER,
+    fighter_1_name  TEXT,
+    fighter_2_name  TEXT,
+    weight_class    TEXT
+)
+"""
+
 CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_fights_event_id      ON fights(event_id)",
     "CREATE INDEX IF NOT EXISTS idx_fights_event_date    ON fights(event_date)",
@@ -135,6 +152,10 @@ CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_fights_method        ON fights(method)",
     "CREATE INDEX IF NOT EXISTS idx_rounds_fight_id      ON fight_rounds(fight_id)",
     "CREATE INDEX IF NOT EXISTS idx_rounds_fighter_name  ON fight_rounds(fighter_name)",
+    "CREATE INDEX IF NOT EXISTS idx_upcoming_event_id    ON upcoming_fights(event_id)",
+    "CREATE INDEX IF NOT EXISTS idx_upcoming_event_date  ON upcoming_fights(event_date)",
+    "CREATE INDEX IF NOT EXISTS idx_upcoming_f1_name     ON upcoming_fights(fighter_1_name)",
+    "CREATE INDEX IF NOT EXISTS idx_upcoming_f2_name     ON upcoming_fights(fighter_2_name)",
 ]
 
 
@@ -173,7 +194,7 @@ def _flatten_fighter(t: dict) -> tuple:
     )
 
 
-def convert(input_path: Path, output_path: Path):
+def convert(input_path: Path, output_path: Path, upcoming_path: Optional[Path] = None):
     print(f"Reading {input_path} ...")
     fights = json.loads(input_path.read_text())
     print(f"  {len(fights)} fights loaded")
@@ -184,6 +205,7 @@ def convert(input_path: Path, output_path: Path):
 
     cur.execute(CREATE_FIGHTS)
     cur.execute(CREATE_ROUNDS)
+    cur.execute(CREATE_UPCOMING)
     for stmt in CREATE_INDEXES:
         cur.execute(stmt)
 
@@ -263,6 +285,32 @@ def convert(input_path: Path, output_path: Path):
         f"INSERT INTO fight_rounds VALUES (NULL,{','.join(['?']*n_rounds)})", round_rows
     )
 
+    # --- upcoming_fights ---
+    upcoming_rows = []
+    resolved_upcoming = upcoming_path if upcoming_path else UPCOMING_JSON
+    if resolved_upcoming.exists():
+        upcoming = json.loads(resolved_upcoming.read_text())
+        for u in upcoming:
+            upcoming_rows.append((
+                u["fight_id"],
+                u.get("event_id"),
+                u.get("event_name"),
+                u.get("event_date"),
+                u.get("event_location"),
+                u.get("card_order"),
+                u.get("fighter_1_name"),
+                u.get("fighter_2_name"),
+                u.get("weight_class"),
+            ))
+        if upcoming_rows:
+            cur.executemany(
+                "INSERT OR REPLACE INTO upcoming_fights VALUES (?,?,?,?,?,?,?,?,?)",
+                upcoming_rows,
+            )
+        print(f"  {len(upcoming_rows)} upcoming fight(s) → upcoming_fights table")
+    else:
+        print(f"  No upcoming.json found — upcoming_fights table empty")
+
     con.commit()
     con.close()
 
@@ -274,7 +322,8 @@ def convert(input_path: Path, output_path: Path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input",  default=str(FIGHTS_JSON))
-    parser.add_argument("--output", default=str(SQLITE_DB))
+    parser.add_argument("--input",    default=str(FIGHTS_JSON))
+    parser.add_argument("--output",   default=str(SQLITE_DB))
+    parser.add_argument("--upcoming", default=None, help="Path to upcoming.json (default: data/ufc/upcoming.json)")
     args = parser.parse_args()
-    convert(Path(args.input), Path(args.output))
+    convert(Path(args.input), Path(args.output), Path(args.upcoming) if args.upcoming else None)

@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 data/ufc/fights.json
 data/ufc/state.json
+data/ufc/upcoming.json
 .DS_Store
 data/ufc/ufc.db
