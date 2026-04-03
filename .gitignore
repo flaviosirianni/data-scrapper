@@ -6,3 +6,9 @@ data/ufc/state.json
 data/ufc/upcoming.json
 .DS_Store
 data/ufc/ufc.db
+data/skyscanner/skyscanner.db
+data/skyscanner/state.json
+data/skyscanner/debug_page.html
+data/skyscanner/debug_api.json
+data/skyscanner/browser_profile/
+data/skyscanner/uc_profile/
